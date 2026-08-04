@@ -10,9 +10,11 @@
 2. 按 5 大板块(行情 / 供应 / 需求 / 库存 / 宏观)写成 **Telegram HTML** 格式,卡片间用
    单独一行 `---SPLIT---` 分隔。版式照抄 [`docs/example-briefing.md`](docs/example-briefing.md)。
 3. 文件写到 `briefings/YYYY-MM-DD-AM.md`(日期用**北京时间 Asia/Shanghai**)。
-4. `git add / commit / pull --rebase / push origin main`。push 后 GitHub Action 自动推送到
-   Telegram 群(`-5275069079`,Jacob 的个人助手)。
-5. **只聚焦铝**;数据必须有真实来源链接,**严禁编造**;空板块写「🈚️ 过去 24 小时内无显著进展」。
+4. **提交前先对齐分支**(fired 会话默认不在 main):`git fetch origin main && git checkout -B main origin/main`,
+   再 `git add / commit / pull --rebase origin main / push origin main`。**完整命令见 GENERATION-GUIDE §5**。
+   push 后 GitHub Action 自动推送到 Telegram 群(`-5275069079`,Jacob 的个人助手)。
+5. **只聚焦铝**;数据必须有真实来源链接,**严禁编造**;空板块写「🈚️ 过去 24 小时内无显著进展」;
+   字面 `& < >` 必须转义;封面计数 = 各板块条目数。
 
 **防御**:若仓库缺 `docs/GENERATION-GUIDE.md` 或 `.github/workflows/daily-briefing.yml`
 (骨架未合并到 main),不要推送,直接报告并结束。

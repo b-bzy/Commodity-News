@@ -3,15 +3,21 @@ name: Aluminum Daily Briefing → Telegram
 # 云端 routine(定时任务)每天早晨生成 briefings/YYYY-MM-DD-AM.md 并 push 到 main 后,
 # 本 Action 自动把成品发送到 Telegram(Jacob 的个人助手)。
 # Token 存为仓库 Secret(TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID),绝不进代码。
+#
+# 健壮性设计(经审计加固):
+#  - HTML 发送失败(如漏转义 & < >)自动降级为纯文本重发,保证送达
+#  - curl 加 --max-time 且不因单条失败而中断整批(去掉 set -e)
+#  - push 事件用完整 before..after 区间解析,支持一次多文件、覆盖更新
+#  - 手动触发/删除类改动优雅跳过,不产生误告警
 on:
   push:
     branches: [main]
     paths:
-      - 'briefings/**.md'
+      - 'briefings/*.md'
   workflow_dispatch:
     inputs:
       file:
-        description: '要发送的 briefing 文件路径(留空 = 用最新的)'
+        description: '要发送的 briefing 文件路径(留空=最新一篇 briefings/*.md)。手动触发请在上方分支下拉选 main。'
         required: false
         default: ''
 
@@ -25,127 +31,138 @@ concurrency:
 jobs:
   push:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    env:
+      LC_ALL: C.UTF-8
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
-      - name: Resolve briefing file
-        id: file
+      - name: Resolve briefing files
+        id: resolve
         env:
           INPUT_FILE: ${{ inputs.file }}
           EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          FILES=""
           if [ -n "${INPUT_FILE:-}" ]; then
-            FILE="$INPUT_FILE"
+            case "$INPUT_FILE" in
+              briefings/*.md) : ;;
+              *) echo "::error::file 只能是 briefings/*.md,收到 '$INPUT_FILE'"; exit 1;;
+            esac
+            [ -f "$INPUT_FILE" ] || { echo "::error::文件不存在: $INPUT_FILE"; exit 1; }
+            FILES="$INPUT_FILE"
           elif [ "$EVENT" = "push" ]; then
-            FILE=$(git diff --name-only --diff-filter=AM HEAD^ HEAD -- 'briefings/*.md' | head -n 1 || true)
+            RANGE=""
+            if [ -n "${BEFORE:-}" ] && ! printf '%s' "$BEFORE" | grep -qE '^0+$' && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              RANGE="${BEFORE} ${AFTER}"
+            elif git rev-parse --verify -q "HEAD^" >/dev/null; then
+              RANGE="HEAD^ HEAD"
+            fi
+            if [ -n "$RANGE" ]; then
+              FILES=$(git diff --name-only --diff-filter=AM $RANGE -- 'briefings/*.md' 2>/dev/null || true)
+            else
+              FILES=$(git show --name-only --diff-filter=AM --pretty=format: HEAD -- 'briefings/*.md' 2>/dev/null || true)
+            fi
           else
-            FILE=$(ls -t briefings/*.md 2>/dev/null | head -n 1 || true)
+            FILES=$(ls -1 briefings/*.md 2>/dev/null | sort -r | head -n 1 || true)
           fi
-          if [ -z "${FILE:-}" ] || [ ! -f "$FILE" ]; then
-            echo "::error::没找到要发送的 briefing 文件 (got: '${FILE:-}')"
-            exit 1
+
+          FILES=$(printf '%s\n' $FILES | awk 'NF' | sort -u)
+          if [ -z "${FILES:-}" ]; then
+            echo "没有需要发送的 briefing(删除类改动或无匹配),优雅跳过。"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
-          echo "Selected: $FILE ($(wc -c <"$FILE") bytes)"
+          echo "将发送以下文件:"; printf '  %s\n' $FILES
+          printf '%s\n' $FILES > /tmp/briefing_files.txt
+          echo "count=$(printf '%s\n' $FILES | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
 
       - name: Send to Telegram
+        if: steps.resolve.outputs.count != '0'
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
-          FILE:     ${{ steps.file.outputs.file }}
         run: |
-          set -euo pipefail
+          set -uo pipefail   # 故意不用 -e:单条 curl 失败不应中断整批
           if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
             echo "::error::缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID secret"
             exit 1
           fi
+          API="https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
 
-          # ========== 按 ---SPLIT--- 拆分 ==========
-          # 每个分块单独发一条消息,实现卡片式阅读体验
-          mkdir -p /tmp/parts
-          rm -f /tmp/parts/*.txt
+          strip_html() { python3 -c 'import sys,re,html; t=sys.stdin.read(); t=re.sub(r"<[^>]+>","",t); sys.stdout.write(html.unescape(t))'; }
 
-          awk -v outdir="/tmp/parts" '
-            BEGIN { idx = 0; file = sprintf("%s/part_%03d.txt", outdir, idx) }
-            /^---SPLIT---[[:space:]]*$/ {
-              close(file)
-              idx++
-              file = sprintf("%s/part_%03d.txt", outdir, idx)
-              next
-            }
-            { print > file }
-          ' "$FILE"
-
-          PART_COUNT=$(ls /tmp/parts/part_*.txt 2>/dev/null | wc -l)
-          echo "Split into $PART_COUNT parts"
-
-          # 如果文件里没有 ---SPLIT--- 分隔符,退化为发整个文件(向后兼容)
-          if [ "$PART_COUNT" -le 1 ]; then
-            echo "No ---SPLIT--- found, sending as single message"
-            cp "$FILE" /tmp/parts/part_000.txt
-          fi
-
-          # ========== 逐块发送 ==========
-          SENT=0
-          FAILED=0
-          for part in /tmp/parts/part_*.txt; do
-            # 跳过空文件 / 仅含空白
-            if [ ! -s "$part" ] || ! grep -q '[^[:space:]]' "$part"; then
-              echo "Skipping empty: $part"
-              continue
-            fi
-
-            TEXT=$(cat "$part")
-            LEN=${#TEXT}
-            echo "→ Sending $part ($LEN chars)"
-
-            # 单条超长保护(Telegram 单条 4096 上限)
-            if [ "$LEN" -gt 4000 ]; then
-              echo "::warning::Part 超 4000 字符,截断"
-              TRUNCATED="${TEXT:0:4000}"
-              TEXT=$(printf '%s\n\n%s' "$TRUNCATED" "…(已截断)")
-            fi
-
-            RESP=$(curl -sS -w '\n---HTTP:%{http_code}' \
-              -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${TG_CHAT}" \
-              --data-urlencode "parse_mode=HTML" \
-              --data-urlencode "disable_web_page_preview=true" \
-              --data-urlencode "text=${TEXT}")
-
-            STATUS=$(echo "$RESP" | tail -n1 | sed 's/.*HTTP://')
-            BODY=$(echo "$RESP" | sed '$d')
-
-            if [ "$STATUS" != "200" ]; then
-              echo "::error::Part $(basename "$part") 发送失败,HTTP $STATUS"
-              echo "Response: $BODY"
-              FAILED=$((FAILED+1))
-              # 不立即 exit,继续尝试发送其他分块,最后统一判断
+          LAST_STATUS=""; LAST_BODY=""
+          send_once() {  # $1=text  $2=html|plain
+            local text="$1" mode="$2" resp
+            if [ "$mode" = html ]; then
+              resp=$(curl --max-time 30 -sS -w '\n---HTTP:%{http_code}' -X POST "$API" \
+                --data-urlencode "chat_id=${TG_CHAT}" \
+                --data-urlencode "parse_mode=HTML" \
+                --data-urlencode "disable_web_page_preview=true" \
+                --data-urlencode "text=${text}" 2>/dev/null) || resp=$'\n---HTTP:000'
             else
-              echo "✓ Sent: $(basename "$part")"
-              SENT=$((SENT+1))
+              resp=$(curl --max-time 30 -sS -w '\n---HTTP:%{http_code}' -X POST "$API" \
+                --data-urlencode "chat_id=${TG_CHAT}" \
+                --data-urlencode "disable_web_page_preview=true" \
+                --data-urlencode "text=${text}" 2>/dev/null) || resp=$'\n---HTTP:000'
             fi
+            LAST_STATUS=$(printf '%s' "$resp" | tail -n1 | sed 's/.*HTTP://')
+            LAST_BODY=$(printf '%s' "$resp" | sed '$d')
+          }
 
-            # Telegram rate limit:同一 chat 每秒 1 条,留点余量
-            sleep 1
-          done
+          SENT=0; FAILED=0; TOTAL=0
+          while IFS= read -r FILE; do
+            [ -n "$FILE" ] || continue
+            [ -f "$FILE" ] || { echo "::warning::跳过不存在文件 $FILE"; continue; }
+            echo "===== 处理 $FILE ====="
+            mkdir -p /tmp/parts; rm -f /tmp/parts/*.txt
+            awk -v outdir="/tmp/parts" '
+              BEGIN { idx=0; file=sprintf("%s/part_%03d.txt",outdir,idx) }
+              /^---SPLIT---[[:space:]]*$/ { close(file); idx++; file=sprintf("%s/part_%03d.txt",outdir,idx); next }
+              { print > file }
+            ' "$FILE"
+            [ "$(ls /tmp/parts/part_*.txt 2>/dev/null | wc -l)" -ge 1 ] || cp "$FILE" /tmp/parts/part_000.txt
 
-          echo ""
+            for part in $(ls /tmp/parts/part_*.txt 2>/dev/null | sort); do
+              TEXT=$(sed '/./,$!d' "$part")            # 去前导空行
+              printf '%s' "$TEXT" | grep -q '[^[:space:]]' || { echo "跳过空块 $(basename "$part")"; continue; }
+              TOTAL=$((TOTAL+1))
+              MODE=html
+              if [ "${#TEXT}" -gt 4000 ]; then
+                echo "::warning::块超长(${#TEXT} 字符),降级纯文本并安全截断"
+                TEXT="$(printf '%s' "$TEXT" | strip_html)"
+                TEXT="${TEXT:0:3800}"$'\n'"…(内容过长已截断,完整版见仓库 $FILE)"
+                MODE=plain
+              fi
+
+              send_once "$TEXT" "$MODE"
+              if [ "$LAST_STATUS" = "200" ]; then
+                echo "✓ 发送成功($MODE) $(basename "$part")"; SENT=$((SENT+1))
+              elif [ "$LAST_STATUS" = "429" ]; then
+                RA=$(printf '%s' "$LAST_BODY" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("parameters",{}).get("retry_after",3))' 2>/dev/null || echo 3)
+                echo "::warning::429 限速,${RA}s 后重试"; sleep "$RA"
+                send_once "$TEXT" "$MODE"
+                if [ "$LAST_STATUS" = "200" ]; then echo "✓ 重试成功"; SENT=$((SENT+1)); else FAILED=$((FAILED+1)); echo "::error::重试仍失败 HTTP $LAST_STATUS: $LAST_BODY"; fi
+              elif [ "$MODE" = html ]; then
+                echo "::warning::HTML 发送失败 HTTP $LAST_STATUS,降级纯文本重发。Body: $LAST_BODY"
+                send_once "$(printf '%s' "$TEXT" | strip_html)" plain
+                if [ "$LAST_STATUS" = "200" ]; then echo "✓ 纯文本降级成功 $(basename "$part")"; SENT=$((SENT+1)); else FAILED=$((FAILED+1)); echo "::error::降级仍失败 HTTP $LAST_STATUS: $LAST_BODY"; fi
+              else
+                FAILED=$((FAILED+1)); echo "::error::发送失败 HTTP $LAST_STATUS: $LAST_BODY"
+              fi
+              sleep 1
+            done
+          done < /tmp/briefing_files.txt
+
           echo "==================================="
-          echo "Sent: $SENT  |  Failed: $FAILED"
+          echo "总块数 $TOTAL  |  成功 $SENT  |  失败 $FAILED"
           echo "==================================="
-
-          if [ "$FAILED" -gt 0 ]; then
-            echo "::error::有 $FAILED 个分块发送失败"
-            exit 1
-          fi
-
-          if [ "$SENT" -eq 0 ]; then
-            echo "::error::没有任何内容被成功发送"
-            exit 1
-          fi
+          [ "$FAILED" -eq 0 ] || { echo "::error::有 $FAILED 块最终发送失败"; exit 1; }
+          [ "$SENT" -gt 0 ] || { echo "::error::没有任何内容成功发送"; exit 1; }
