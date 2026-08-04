@@ -57,6 +57,12 @@
 正文是 **Telegram HTML**(`parse_mode=HTML`),**不是 Markdown**。允许标签:
 `<b>` `<i>` `<a href="...">` `<blockquote expandable>`。**不要**用 `#`、`**`、`- ` 之外的 Markdown。
 
+> ⚠️ **HTML 转义(必做)**:Telegram HTML 模式下,正文里作为**字面字符**出现的 `&` `<` `>`
+> 必须转义成 `&amp;` `&lt;` `&gt;`,否则 Telegram API 报 400、整条卡片发送失败。
+> 常见场景:`S&P` → `S&amp;P`、`R&D` → `R&amp;D`、`同比 <5%` → `同比 &lt;5%`、
+> `>3000 元` → `&gt;3000 元`。**只有标签本身**(`<b>`/`<a href>` 等)不转义。
+> URL 里的 `&`(如 `?a=1&b=2`)也要写成 `&amp;`。
+
 **卡片切分**:每个板块(以及开头的封面)之间用**单独一行** `---SPLIT---` 分隔。
 GitHub Action 会按它把早报拆成多条 Telegram 消息,逐条发送,形成卡片式阅读体验。
 
@@ -97,6 +103,9 @@ GitHub Action 会按它把早报拆成多条 Telegram 消息,逐条发送,形成
 ## 5. 生成后:提交与推送
 
 ```bash
+# push 前必须确认在正确的仓库(只能是 b-bzy/Commodity-News)
+git remote get-url origin | grep -qi 'Commodity-News' || { echo "非 Commodity-News 仓库,中止"; exit 1; }
+
 DATE=$(TZ=Asia/Shanghai date +%F)
 git add "briefings/${DATE}-AM.md"
 git commit -m "briefing: 铝市早报 ${DATE}"

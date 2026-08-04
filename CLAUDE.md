@@ -19,5 +19,8 @@
 
 ## 关键约定
 
+- **仓库固定为 `b-bzy/Commodity-News`**:所有 git 操作只在本仓库进行。任何 push 前必须
+  先 `git remote get-url origin` 确认输出含 `Commodity-News`;若指向别的仓库(如
+  `ai-daily-briefing` / `ai-hotspot-daily`)立即中止,绝不误推。
 - 推送目标群 `TELEGRAM_CHAT_ID` = `-5275069079`;bot token 存仓库 Secret,不进代码。
 - 生成产物只放 `briefings/`,`docs/` 下的示例不会触发推送。
