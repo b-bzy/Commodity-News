@@ -1,0 +1,7 @@
+# 每日铝市早报存放目录
+#
+# 云端定时任务每天早晨在此生成 YYYY-MM-DD-AM.md,
+# push 到 main 后触发 .github/workflows/daily-briefing.yml 自动推送到 Telegram。
+#
+# 文件命名:YYYY-MM-DD-AM.md(北京时间日期)
+# 文件格式:Telegram HTML,卡片之间用 ---SPLIT--- 分隔(详见 docs/GENERATION-GUIDE.md)

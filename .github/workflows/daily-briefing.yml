@@ -1,0 +1,151 @@
+name: Aluminum Daily Briefing → Telegram
+
+# 云端 routine(定时任务)每天早晨生成 briefings/YYYY-MM-DD-AM.md 并 push 到 main 后,
+# 本 Action 自动把成品发送到 Telegram(Jacob 的个人助手)。
+# Token 存为仓库 Secret(TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID),绝不进代码。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'briefings/**.md'
+  workflow_dispatch:
+    inputs:
+      file:
+        description: '要发送的 briefing 文件路径(留空 = 用最新的)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-briefing
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Resolve briefing file
+        id: file
+        env:
+          INPUT_FILE: ${{ inputs.file }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_FILE:-}" ]; then
+            FILE="$INPUT_FILE"
+          elif [ "$EVENT" = "push" ]; then
+            FILE=$(git diff --name-only --diff-filter=AM HEAD^ HEAD -- 'briefings/*.md' | head -n 1 || true)
+          else
+            FILE=$(ls -t briefings/*.md 2>/dev/null | head -n 1 || true)
+          fi
+          if [ -z "${FILE:-}" ] || [ ! -f "$FILE" ]; then
+            echo "::error::没找到要发送的 briefing 文件 (got: '${FILE:-}')"
+            exit 1
+          fi
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "Selected: $FILE ($(wc -c <"$FILE") bytes)"
+
+      - name: Send to Telegram
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          FILE:     ${{ steps.file.outputs.file }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
+            echo "::error::缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID secret"
+            exit 1
+          fi
+
+          # ========== 按 ---SPLIT--- 拆分 ==========
+          # 每个分块单独发一条消息,实现卡片式阅读体验
+          mkdir -p /tmp/parts
+          rm -f /tmp/parts/*.txt
+
+          awk -v outdir="/tmp/parts" '
+            BEGIN { idx = 0; file = sprintf("%s/part_%03d.txt", outdir, idx) }
+            /^---SPLIT---[[:space:]]*$/ {
+              close(file)
+              idx++
+              file = sprintf("%s/part_%03d.txt", outdir, idx)
+              next
+            }
+            { print > file }
+          ' "$FILE"
+
+          PART_COUNT=$(ls /tmp/parts/part_*.txt 2>/dev/null | wc -l)
+          echo "Split into $PART_COUNT parts"
+
+          # 如果文件里没有 ---SPLIT--- 分隔符,退化为发整个文件(向后兼容)
+          if [ "$PART_COUNT" -le 1 ]; then
+            echo "No ---SPLIT--- found, sending as single message"
+            cp "$FILE" /tmp/parts/part_000.txt
+          fi
+
+          # ========== 逐块发送 ==========
+          SENT=0
+          FAILED=0
+          for part in /tmp/parts/part_*.txt; do
+            # 跳过空文件 / 仅含空白
+            if [ ! -s "$part" ] || ! grep -q '[^[:space:]]' "$part"; then
+              echo "Skipping empty: $part"
+              continue
+            fi
+
+            TEXT=$(cat "$part")
+            LEN=${#TEXT}
+            echo "→ Sending $part ($LEN chars)"
+
+            # 单条超长保护(Telegram 单条 4096 上限)
+            if [ "$LEN" -gt 4000 ]; then
+              echo "::warning::Part 超 4000 字符,截断"
+              TRUNCATED="${TEXT:0:4000}"
+              TEXT=$(printf '%s\n\n%s' "$TRUNCATED" "…(已截断)")
+            fi
+
+            RESP=$(curl -sS -w '\n---HTTP:%{http_code}' \
+              -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "disable_web_page_preview=true" \
+              --data-urlencode "text=${TEXT}")
+
+            STATUS=$(echo "$RESP" | tail -n1 | sed 's/.*HTTP://')
+            BODY=$(echo "$RESP" | sed '$d')
+
+            if [ "$STATUS" != "200" ]; then
+              echo "::error::Part $(basename "$part") 发送失败,HTTP $STATUS"
+              echo "Response: $BODY"
+              FAILED=$((FAILED+1))
+              # 不立即 exit,继续尝试发送其他分块,最后统一判断
+            else
+              echo "✓ Sent: $(basename "$part")"
+              SENT=$((SENT+1))
+            fi
+
+            # Telegram rate limit:同一 chat 每秒 1 条,留点余量
+            sleep 1
+          done
+
+          echo ""
+          echo "==================================="
+          echo "Sent: $SENT  |  Failed: $FAILED"
+          echo "==================================="
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo "::error::有 $FAILED 个分块发送失败"
+            exit 1
+          fi
+
+          if [ "$SENT" -eq 0 ]; then
+            echo "::error::没有任何内容被成功发送"
+            exit 1
+          fi
